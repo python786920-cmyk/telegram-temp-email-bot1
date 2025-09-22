@@ -1,256 +1,444 @@
 const express = require('express');
+const cors = require('cors');
+const helmet = require('helmet');
+const compression = require('compression');
 const WebSocket = require('ws');
 const mysql = require('mysql2/promise');
-const cors = require('cors');
-const bodyParser = require('body-parser');
+const axios = require('axios');
+const { createServer } = require('http');
 require('dotenv').config();
 
-const app = express();
-const PORT = process.env.PORT || 3000;
-const WS_PORT = process.env.WS_PORT || 3001;
+class TempEmailServer {
+    constructor() {
+        this.app = express();
+        this.server = createServer(this.app);
+        this.wss = new WebSocket.Server({ server: this.server });
+        this.dbPool = null;
+        this.clients = new Map();
+        this.activeEmails = new Map();
+        this.init();
+    }
 
-// Middleware
-app.use(cors());
-app.use(bodyParser.json());
-app.use(bodyParser.urlencoded({ extended: true }));
+    async init() {
+        await this.setupDatabase();
+        this.setupMiddleware();
+        this.setupWebSocket();
+        this.setupRoutes();
+        this.startServer();
+        this.startAutoRefresh();
+    }
 
-// Database connection pool
-const dbConfig = {
-    host: process.env.DB_HOST,
-    user: process.env.DB_USER,
-    password: process.env.DB_PASSWORD,
-    database: process.env.DB_NAME,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
-};
+    async setupDatabase() {
+        this.dbPool = mysql.createPool({
+            host: process.env.DB_HOST,
+            user: process.env.DB_USER,
+            password: process.env.DB_PASS,
+            database: process.env.DB_NAME,
+            waitForConnections: true,
+            connectionLimit: parseInt(process.env.DB_CONNECTION_LIMIT) || 10,
+            queueLimit: 0,
+            acquireTimeout: parseInt(process.env.DB_ACQUIRE_TIMEOUT) || 60000,
+            timeout: parseInt(process.env.DB_TIMEOUT) || 60000
+        });
 
-const pool = mysql.createPool(dbConfig);
+        // Create table if not exists
+        const createTableQuery = `
+            CREATE TABLE IF NOT EXISTS emails (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                email VARCHAR(255) NOT NULL UNIQUE,
+                password VARCHAR(255) NOT NULL,
+                token TEXT NOT NULL,
+                telegram_user_id BIGINT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                last_access TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+                INDEX idx_email (email),
+                INDEX idx_telegram_user_id (telegram_user_id),
+                INDEX idx_last_access (last_access)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+        `;
 
-// WebSocket server for real-time updates
-const wss = new WebSocket.Server({ port: WS_PORT });
-
-// Store active WebSocket connections
-const activeConnections = new Map();
-
-wss.on('connection', (ws) => {
-    console.log('New WebSocket connection established');
-    
-    ws.on('message', (message) => {
         try {
-            const data = JSON.parse(message);
-            if (data.type === 'register' && data.userId) {
-                activeConnections.set(data.userId, ws);
-                console.log(`User ${data.userId} registered for WebSocket updates`);
-            }
+            await this.dbPool.execute(createTableQuery);
+            console.log('📊 Database table initialized successfully');
         } catch (error) {
-            console.error('WebSocket message error:', error);
+            console.error('❌ Database initialization error:', error);
+            process.exit(1);
         }
-    });
+    }
 
-    ws.on('close', () => {
-        // Remove connection from active connections
-        for (const [userId, connection] of activeConnections.entries()) {
-            if (connection === ws) {
-                activeConnections.delete(userId);
-                console.log(`User ${userId} WebSocket connection closed`);
-                break;
+    setupMiddleware() {
+        this.app.use(helmet({
+            contentSecurityPolicy: {
+                directives: {
+                    defaultSrc: ["'self'"],
+                    styleSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com"],
+                    scriptSrc: ["'self'", "'unsafe-inline'", "https://cdnjs.cloudflare.com"],
+                    imgSrc: ["'self'", "data:", "https:"],
+                    connectSrc: ["'self'", "ws:", "wss:"],
+                    fontSrc: ["'self'", "https://cdnjs.cloudflare.com"],
+                }
             }
-        }
-    });
-});
-
-// Helper function to update last_access timestamp
-async function updateLastAccess(email) {
-    try {
-        const connection = await pool.getConnection();
-        await connection.execute("UPDATE emails SET last_access = NOW() WHERE email = ?", [email]);
-        connection.release();
-    } catch (error) {
-        console.error('Error updating last access:', error);
+        }));
+        
+        this.app.use(compression());
+        this.app.use(cors({
+            origin: process.env.CORS_ORIGIN || '*',
+            methods: ['GET', 'POST', 'PUT', 'DELETE'],
+            allowedHeaders: ['Content-Type', 'Authorization']
+        }));
+        
+        this.app.use(express.json({ limit: '10mb' }));
+        this.app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+        
+        // Rate limiting middleware
+        this.app.use((req, res, next) => {
+            const clientIP = req.ip || req.connection.remoteAddress;
+            const now = Date.now();
+            
+            if (!this.rateLimitMap) this.rateLimitMap = new Map();
+            
+            const clientData = this.rateLimitMap.get(clientIP) || { requests: 0, resetTime: now + 60000 };
+            
+            if (now > clientData.resetTime) {
+                clientData.requests = 0;
+                clientData.resetTime = now + 60000;
+            }
+            
+            if (clientData.requests >= (process.env.RATE_LIMIT || 100)) {
+                return res.status(429).json({ error: 'Rate limit exceeded' });
+            }
+            
+            clientData.requests++;
+            this.rateLimitMap.set(clientIP, clientData);
+            next();
+        });
     }
-}
 
-// Helper function to broadcast updates to WebSocket clients
-function broadcastUpdate(userId, data) {
-    if (activeConnections.has(userId)) {
-        const ws = activeConnections.get(userId);
-        if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify(data));
+    setupWebSocket() {
+        this.wss.on('connection', (ws, req) => {
+            const clientId = this.generateId();
+            this.clients.set(clientId, ws);
+            
+            console.log(`🔗 WebSocket client connected: ${clientId}`);
+            
+            ws.on('message', async (message) => {
+                try {
+                    const data = JSON.parse(message);
+                    await this.handleWebSocketMessage(ws, data, clientId);
+                } catch (error) {
+                    ws.send(JSON.stringify({ error: 'Invalid message format' }));
+                }
+            });
+            
+            ws.on('close', () => {
+                this.clients.delete(clientId);
+                console.log(`🔌 WebSocket client disconnected: ${clientId}`);
+            });
+            
+            ws.on('error', (error) => {
+                console.error('WebSocket error:', error);
+                this.clients.delete(clientId);
+            });
+        });
+    }
+
+    async handleWebSocketMessage(ws, data, clientId) {
+        const { action, email, token, telegramUserId } = data;
+        
+        switch (action) {
+            case 'subscribe':
+                if (email && token) {
+                    this.activeEmails.set(email, { ws, clientId, token, telegramUserId });
+                    ws.send(JSON.stringify({ 
+                        action: 'subscribed', 
+                        email,
+                        message: 'Successfully subscribed to email updates'
+                    }));
+                }
+                break;
+                
+            case 'unsubscribe':
+                if (email) {
+                    this.activeEmails.delete(email);
+                    ws.send(JSON.stringify({ 
+                        action: 'unsubscribed', 
+                        email,
+                        message: 'Successfully unsubscribed from email updates'
+                    }));
+                }
+                break;
+                
+            case 'ping':
+                ws.send(JSON.stringify({ action: 'pong', timestamp: Date.now() }));
+                break;
         }
     }
-}
 
-// Email service functions
-class EmailService {
-    static async generateEmail() {
+    setupRoutes() {
+        // Health check
+        this.app.get('/health', (req, res) => {
+            res.json({ 
+                status: 'healthy', 
+                timestamp: new Date().toISOString(),
+                uptime: process.uptime(),
+                memory: process.memoryUsage(),
+                activeConnections: this.clients.size,
+                activeEmails: this.activeEmails.size
+            });
+        });
+
+        // Generate new email
+        this.app.post('/api/generate', async (req, res) => {
+            try {
+                const { telegramUserId } = req.body;
+                const result = await this.generateEmail(telegramUserId);
+                res.json(result);
+            } catch (error) {
+                console.error('Generate email error:', error);
+                res.status(500).json({ error: 'Failed to generate email' });
+            }
+        });
+
+        // Get inbox messages
+        this.app.get('/api/inbox/:email', async (req, res) => {
+            try {
+                const { email } = req.params;
+                const { token } = req.query;
+                const messages = await this.getInboxMessages(email, token);
+                res.json(messages);
+            } catch (error) {
+                console.error('Get inbox error:', error);
+                res.status(500).json({ error: 'Failed to fetch inbox' });
+            }
+        });
+
+        // Read specific message
+        this.app.get('/api/message/:email/:messageId', async (req, res) => {
+            try {
+                const { email, messageId } = req.params;
+                const { token } = req.query;
+                const message = await this.readMessage(messageId, token);
+                await this.updateLastAccess(email);
+                res.json(message);
+            } catch (error) {
+                console.error('Read message error:', error);
+                res.status(500).json({ error: 'Failed to read message' });
+            }
+        });
+
+        // Delete message
+        this.app.delete('/api/message/:email/:messageId', async (req, res) => {
+            try {
+                const { email, messageId } = req.params;
+                const { token } = req.query;
+                await this.deleteMessage(messageId, token);
+                await this.updateLastAccess(email);
+                res.json({ success: true });
+            } catch (error) {
+                console.error('Delete message error:', error);
+                res.status(500).json({ error: 'Failed to delete message' });
+            }
+        });
+
+        // Recover email
+        this.app.post('/api/recover', async (req, res) => {
+            try {
+                const { email, telegramUserId } = req.body;
+                const result = await this.recoverEmail(email, telegramUserId);
+                res.json(result);
+            } catch (error) {
+                console.error('Recover email error:', error);
+                res.status(500).json({ error: 'Failed to recover email' });
+            }
+        });
+
+        // Get user emails
+        this.app.get('/api/user/:telegramUserId/emails', async (req, res) => {
+            try {
+                const { telegramUserId } = req.params;
+                const emails = await this.getUserEmails(telegramUserId);
+                res.json(emails);
+            } catch (error) {
+                console.error('Get user emails error:', error);
+                res.status(500).json({ error: 'Failed to fetch user emails' });
+            }
+        });
+
+        // Webhook endpoint for bot
+        this.app.post('/webhook', (req, res) => {
+            // This will be handled by the bot instance
+            res.sendStatus(200);
+        });
+
+        // Default route
+        this.app.get('/', (req, res) => {
+            res.json({
+                name: 'Professional Temp Email API',
+                version: '1.0.0',
+                status: 'running',
+                endpoints: {
+                    generate: 'POST /api/generate',
+                    inbox: 'GET /api/inbox/:email',
+                    message: 'GET /api/message/:email/:messageId',
+                    delete: 'DELETE /api/message/:email/:messageId',
+                    recover: 'POST /api/recover',
+                    userEmails: 'GET /api/user/:telegramUserId/emails',
+                    health: 'GET /health'
+                }
+            });
+        });
+    }
+
+    async generateEmail(telegramUserId = null) {
         try {
             // Get available domains
-            const axios = require('axios');
-            const domainResponse = await axios.get('https://api.mail.tm/domains');
-            const domains = domainResponse.data['hydra:member'].map(d => d.domain);
+            const domainsResponse = await axios.get(`${process.env.MAIL_TM_BASE_URL}/domains`);
+            const domains = domainsResponse.data['hydra:member'].map(d => d.domain);
             const domain = domains[Math.floor(Math.random() * domains.length)];
 
-            // Generate username
+            // Generate unique username
             const prefixes = ['temp', 'quick', 'fast', 'instant', 'rapid', 'swift', 'flash'];
             const username = prefixes[Math.floor(Math.random() * prefixes.length)] + 
-                           Math.floor(100000 + Math.random() * 900000);
+                           Math.floor(Math.random() * 900000 + 100000);
             const email = `${username}@${domain}`;
-            const password = `TempMail${Math.floor(100 + Math.random() * 900)}!`;
+            const password = `TempMail${Math.floor(Math.random() * 900 + 100)}!`;
 
-            // Create account
-            const createResponse = await axios.post('https://api.mail.tm/accounts', {
+            // Create account on mail.tm
+            const createResponse = await axios.post(`${process.env.MAIL_TM_BASE_URL}/accounts`, {
                 address: email,
                 password: password
-            }, {
-                headers: { 'Content-Type': 'application/json' }
             });
 
             if (createResponse.status !== 201) {
-                throw new Error('Failed to create account');
+                throw new Error('Failed to create email account');
             }
 
-            // Get token
-            const tokenResponse = await axios.post('https://api.mail.tm/token', {
+            // Get authentication token
+            const tokenResponse = await axios.post(`${process.env.MAIL_TM_BASE_URL}/token`, {
                 address: email,
                 password: password
-            }, {
-                headers: { 'Content-Type': 'application/json' }
             });
 
-            if (!tokenResponse.data.token) {
-                throw new Error('Failed to get token');
-            }
+            const token = tokenResponse.data.token;
 
             // Save to database
-            const connection = await pool.getConnection();
-            await connection.execute(
-                "INSERT INTO emails (email, password, token, created_at, last_access) VALUES (?, ?, ?, NOW(), NOW())",
-                [email, password, tokenResponse.data.token]
-            );
-            connection.release();
+            const query = `
+                INSERT INTO emails (email, password, token, telegram_user_id, created_at, last_access) 
+                VALUES (?, ?, ?, ?, NOW(), NOW())
+            `;
+            
+            await this.dbPool.execute(query, [email, password, token, telegramUserId]);
 
             return {
                 email,
                 password,
-                token: tokenResponse.data.token,
-                domains
+                token,
+                domains,
+                created: new Date().toISOString()
             };
+
         } catch (error) {
             console.error('Generate email error:', error);
-            throw new Error('Failed to generate email');
+            throw error;
         }
     }
 
-    static async getInbox(token, email) {
+    async getInboxMessages(email, token) {
         try {
-            const axios = require('axios');
-            let currentToken = token;
-
-            // Try to fetch messages
+            // First try with current token
             let response;
             try {
-                response = await axios.get('https://api.mail.tm/messages', {
-                    headers: { 'Authorization': `Bearer ${currentToken}` }
+                response = await axios.get(`${process.env.MAIL_TM_BASE_URL}/messages`, {
+                    headers: { Authorization: `Bearer ${token}` }
                 });
             } catch (error) {
-                if (error.response && error.response.status === 401) {
+                if (error.response?.status === 401) {
                     // Token expired, refresh it
-                    const connection = await pool.getConnection();
-                    const [rows] = await connection.execute("SELECT password FROM emails WHERE email = ?", [email]);
-                    connection.release();
-
-                    if (rows.length === 0) {
-                        throw new Error('Email not found in database');
-                    }
-
-                    // Refresh token
-                    const tokenResponse = await axios.post('https://api.mail.tm/token', {
-                        address: email,
-                        password: rows[0].password
-                    }, {
-                        headers: { 'Content-Type': 'application/json' }
+                    const newToken = await this.refreshToken(email);
+                    response = await axios.get(`${process.env.MAIL_TM_BASE_URL}/messages`, {
+                        headers: { Authorization: `Bearer ${newToken}` }
                     });
-
-                    if (!tokenResponse.data.token) {
-                        throw new Error('Failed to refresh token');
-                    }
-
-                    currentToken = tokenResponse.data.token;
-
-                    // Update token in database
-                    const updateConnection = await pool.getConnection();
-                    await updateConnection.execute(
-                        "UPDATE emails SET token = ?, last_access = NOW() WHERE email = ?",
-                        [currentToken, email]
-                    );
-                    updateConnection.release();
-
-                    // Retry with new token
-                    response = await axios.get('https://api.mail.tm/messages', {
-                        headers: { 'Authorization': `Bearer ${currentToken}` }
-                    });
+                    token = newToken;
                 } else {
                     throw error;
                 }
             }
 
-            const messages = (response.data['hydra:member'] || []).map(msg => ({
-                from: msg.from.address,
-                subject: msg.subject,
+            const messages = response.data['hydra:member'] || [];
+            await this.updateLastAccess(email);
+
+            return messages.map(msg => ({
                 id: msg.id,
+                from: msg.from.address,
+                subject: msg.subject || 'No Subject',
                 createdAt: msg.createdAt,
-                hasAttachments: msg.attachments && msg.attachments.length > 0,
-                seen: msg.seen
+                hasAttachments: !!(msg.attachments && msg.attachments.length > 0),
+                seen: msg.seen,
+                intro: msg.intro || ''
             }));
 
-            await updateLastAccess(email);
-            return { messages, token: currentToken };
         } catch (error) {
-            console.error('Get inbox error:', error);
-            throw new Error('Failed to fetch inbox');
+            console.error('Get inbox messages error:', error);
+            throw error;
         }
     }
 
-    static async readMessage(token, id, email) {
+    async readMessage(messageId, token) {
         try {
-            const axios = require('axios');
-            const response = await axios.get(`https://api.mail.tm/messages/${id}`, {
-                headers: { 'Authorization': `Bearer ${token}` }
+            const response = await axios.get(`${process.env.MAIL_TM_BASE_URL}/messages/${messageId}`, {
+                headers: { Authorization: `Bearer ${token}` }
             });
 
-            await updateLastAccess(email);
             return response.data;
         } catch (error) {
             console.error('Read message error:', error);
-            throw new Error('Failed to read message');
+            throw error;
         }
     }
 
-    static async deleteMessage(token, id, email) {
+    async deleteMessage(messageId, token) {
         try {
-            const axios = require('axios');
-            await axios.delete(`https://api.mail.tm/messages/${id}`, {
-                headers: { 'Authorization': `Bearer ${token}` }
+            await axios.delete(`${process.env.MAIL_TM_BASE_URL}/messages/${messageId}`, {
+                headers: { Authorization: `Bearer ${token}` }
             });
-
-            await updateLastAccess(email);
-            return { success: true };
         } catch (error) {
             console.error('Delete message error:', error);
-            throw new Error('Failed to delete message');
+            throw error;
         }
     }
 
-    static async recoverEmail(email) {
+    async refreshToken(email) {
         try {
-            const connection = await pool.getConnection();
-            const [rows] = await connection.execute(
-                "SELECT email, password, token, created_at FROM emails WHERE email = ?",
-                [email]
-            );
-            connection.release();
+            const query = 'SELECT password FROM emails WHERE email = ?';
+            const [rows] = await this.dbPool.execute(query, [email]);
+            
+            if (rows.length === 0) {
+                throw new Error('Email not found');
+            }
 
+            const tokenResponse = await axios.post(`${process.env.MAIL_TM_BASE_URL}/token`, {
+                address: email,
+                password: rows[0].password
+            });
+
+            const newToken = tokenResponse.data.token;
+
+            // Update token in database
+            const updateQuery = 'UPDATE emails SET token = ?, last_access = NOW() WHERE email = ?';
+            await this.dbPool.execute(updateQuery, [newToken, email]);
+
+            return newToken;
+        } catch (error) {
+            console.error('Refresh token error:', error);
+            throw error;
+        }
+    }
+
+    async recoverEmail(email, telegramUserId = null) {
+        try {
+            const query = 'SELECT email, password, token, created_at FROM emails WHERE email = ?';
+            const [rows] = await this.dbPool.execute(query, [email]);
+            
             if (rows.length === 0) {
                 throw new Error('Email not found in database');
             }
@@ -258,112 +446,124 @@ class EmailService {
             const emailData = rows[0];
 
             // Try to refresh token
-            const axios = require('axios');
-            const tokenResponse = await axios.post('https://api.mail.tm/token', {
-                address: emailData.email,
-                password: emailData.password
-            }, {
-                headers: { 'Content-Type': 'application/json' }
-            });
+            const newToken = await this.refreshToken(email);
 
-            if (!tokenResponse.data.token) {
-                throw new Error('Failed to refresh token');
+            // Update telegram_user_id if provided
+            if (telegramUserId) {
+                const updateQuery = 'UPDATE emails SET telegram_user_id = ?, last_access = NOW() WHERE email = ?';
+                await this.dbPool.execute(updateQuery, [telegramUserId, email]);
             }
-
-            // Update token in database
-            const updateConnection = await pool.getConnection();
-            await updateConnection.execute(
-                "UPDATE emails SET token = ?, last_access = NOW() WHERE email = ?",
-                [tokenResponse.data.token, emailData.email]
-            );
-            updateConnection.release();
 
             return {
                 email: emailData.email,
-                token: tokenResponse.data.token
+                token: newToken,
+                created: emailData.created_at
             };
+
         } catch (error) {
             console.error('Recover email error:', error);
-            throw new Error('Failed to recover email');
+            throw error;
         }
+    }
+
+    async getUserEmails(telegramUserId) {
+        try {
+            const query = `
+                SELECT email, created_at, last_access 
+                FROM emails 
+                WHERE telegram_user_id = ? 
+                ORDER BY last_access DESC
+            `;
+            const [rows] = await this.dbPool.execute(query, [telegramUserId]);
+            
+            return rows;
+        } catch (error) {
+            console.error('Get user emails error:', error);
+            throw error;
+        }
+    }
+
+    async updateLastAccess(email) {
+        try {
+            const query = 'UPDATE emails SET last_access = NOW() WHERE email = ?';
+            await this.dbPool.execute(query, [email]);
+        } catch (error) {
+            console.error('Update last access error:', error);
+        }
+    }
+
+    // Auto-refresh functionality for WebSocket clients
+    startAutoRefresh() {
+        setInterval(async () => {
+            for (const [email, client] of this.activeEmails.entries()) {
+                try {
+                    const messages = await this.getInboxMessages(email, client.token);
+                    
+                    if (client.ws.readyState === WebSocket.OPEN) {
+                        client.ws.send(JSON.stringify({
+                            action: 'inbox_update',
+                            email,
+                            messages,
+                            timestamp: Date.now()
+                        }));
+                    } else {
+                        this.activeEmails.delete(email);
+                    }
+                } catch (error) {
+                    console.error(`Auto-refresh error for ${email}:`, error);
+                    if (client.ws.readyState === WebSocket.OPEN) {
+                        client.ws.send(JSON.stringify({
+                            action: 'error',
+                            email,
+                            error: 'Failed to refresh inbox'
+                        }));
+                    }
+                }
+            }
+        }, parseInt(process.env.AUTO_REFRESH_INTERVAL) || 10000);
+    }
+
+    generateId() {
+        return Math.random().toString(36).substring(2, 15) + Math.random().toString(36).substring(2, 15);
+    }
+
+    startServer() {
+        const port = process.env.PORT || 3000;
+        this.server.listen(port, () => {
+            console.log('🚀 Professional Temp Email Server Started');
+            console.log(`📡 HTTP Server: http://localhost:${port}`);
+            console.log(`🔌 WebSocket Server: ws://localhost:${port}`);
+            console.log(`📊 Database: Connected to ${process.env.DB_NAME}`);
+            console.log(`⚡ Environment: ${process.env.NODE_ENV}`);
+            console.log('=====================================');
+        });
+
+        // Graceful shutdown
+        process.on('SIGTERM', () => {
+            console.log('🛑 SIGTERM received, shutting down gracefully');
+            this.server.close(() => {
+                console.log('✅ Server closed');
+                if (this.dbPool) {
+                    this.dbPool.end();
+                    console.log('✅ Database connections closed');
+                }
+                process.exit(0);
+            });
+        });
+
+        process.on('SIGINT', () => {
+            console.log('🛑 SIGINT received, shutting down gracefully');
+            this.server.close(() => {
+                console.log('✅ Server closed');
+                if (this.dbPool) {
+                    this.dbPool.end();
+                    console.log('✅ Database connections closed');
+                }
+                process.exit(0);
+            });
+        });
     }
 }
 
-// API Routes
-app.get('/api/generate', async (req, res) => {
-    try {
-        const result = await EmailService.generateEmail();
-        res.json(result);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.get('/api/inbox', async (req, res) => {
-    try {
-        const { token, email } = req.query;
-        if (!token || !email) {
-            return res.status(400).json({ error: 'Token and email required' });
-        }
-
-        const result = await EmailService.getInbox(token, email);
-        res.json(result);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.get('/api/read', async (req, res) => {
-    try {
-        const { token, id, email } = req.query;
-        const result = await EmailService.readMessage(token, id, email);
-        res.json(result);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.delete('/api/delete', async (req, res) => {
-    try {
-        const { token, id, email } = req.query;
-        const result = await EmailService.deleteMessage(token, id, email);
-        res.json(result);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-app.post('/api/recover', async (req, res) => {
-    try {
-        const { email } = req.body;
-        if (!email) {
-            return res.status(400).json({ error: 'Email address required' });
-        }
-
-        const result = await EmailService.recoverEmail(email);
-        res.json(result);
-    } catch (error) {
-        res.status(500).json({ error: error.message });
-    }
-});
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-    res.json({ status: 'OK', timestamp: new Date().toISOString() });
-});
-
-// Error handling middleware
-app.use((error, req, res, next) => {
-    console.error('Server error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-});
-
-// Start server
-app.listen(PORT, () => {
-    console.log(`🚀 Server running on port ${PORT}`);
-    console.log(`🔌 WebSocket server running on port ${WS_PORT}`);
-    console.log(`🤖 Ready for Telegram Bot integration`);
-});
-
-// Export for bot integration
-module.exports = { app, EmailService, broadcastUpdate, activeConnections };
+// Start the server
+new TempEmailServer();
