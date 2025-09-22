@@ -1,652 +1,405 @@
-const TelegramBot = require('node-telegram-bot-api');
+const { Telegraf, Markup } = require('telegraf');
 const axios = require('axios');
-const WebSocket = require('ws');
-require('dotenv').config();
 
-class TempEmailTelegramBot {
-    constructor() {
-        this.bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { polling: true });
-        this.serverUrl = process.env.WEBHOOK_URL || 'http://localhost:3000';
-        this.userStates = new Map();
-        this.activeConnections = new Map();
-        this.init();
+const bot = new Telegraf(process.env.BOT_TOKEN);
+
+// User sessions for recovery process
+const userSessions = new Map();
+
+// Keyboard layout - exactly as specified
+const mainKeyboard = Markup.keyboard([
+  ['📧 My Email'],
+  ['🔄 Generate New', '📥 Inbox'],
+  ['♻️ Recovery']
+]).resize().persistent();
+
+// Email service functions
+class EmailService {
+  static async getDomains() {
+    try {
+      const response = await axios.get(`${process.env.MAIL_TM_API_URL}/domains`);
+      return response.data['hydra:member'] || [];
+    } catch (error) {
+      console.error('Error fetching domains:', error);
+      return [];
     }
+  }
 
-    init() {
-        this.setupCommands();
-        this.setupCallbacks();
-        this.setupErrorHandling();
-        console.log('🤖 Telegram Bot Started Successfully');
-        console.log('📱 Bot is ready to receive messages');
+  static async createAccount(email, password) {
+    try {
+      const response = await axios.post(`${process.env.MAIL_TM_API_URL}/accounts`, {
+        address: email,
+        password: password
+      });
+      return response.data;
+    } catch (error) {
+      console.error('Error creating account:', error);
+      return null;
     }
+  }
 
-    setupCommands() {
-        // Start command
-        this.bot.onText(/\/start/, async (msg) => {
-            const chatId = msg.chat.id;
-            const firstName = msg.from.first_name || 'User';
-            
-            await this.sendWelcomeMessage(chatId, firstName);
-        });
-
-        // Help command
-        this.bot.onText(/\/help/, async (msg) => {
-            const chatId = msg.chat.id;
-            
-            const helpText = `
-🔥 *Available Commands:*
-
-🎯 /start - Start the bot
-📧 /email - Get current email
-🆕 /generate - Generate new email
-📥 /inbox - Check inbox
-♻️ /recover - Recover email
-📊 /stats - View statistics
-❓ /help - Show this help
-
-💡 *Quick Access:*
-Use the keyboard buttons below for quick actions!
-            `;
-
-            await this.bot.sendMessage(chatId, helpText, { 
-                parse_mode: 'Markdown',
-                reply_markup: this.getMainKeyboard()
-            });
-        });
-
-        // Generate command
-        this.bot.onText(/\/generate/, async (msg) => {
-            const chatId = msg.chat.id;
-            await this.handleGenerateEmail(chatId, msg.from.id);
-        });
-
-        // Email command
-        this.bot.onText(/\/email/, async (msg) => {
-            const chatId = msg.chat.id;
-            await this.handleMyEmail(chatId, msg.from.id);
-        });
-
-        // Inbox command
-        this.bot.onText(/\/inbox/, async (msg) => {
-            const chatId = msg.chat.id;
-            await this.handleInbox(chatId, msg.from.id);
-        });
-
-        // Recover command
-        this.bot.onText(/\/recover/, async (msg) => {
-            const chatId = msg.chat.id;
-            await this.handleRecovery(chatId, msg.from.id);
-        });
-
-        // Stats command
-        this.bot.onText(/\/stats/, async (msg) => {
-            const chatId = msg.chat.id;
-            await this.handleStats(chatId, msg.from.id);
-        });
+  static async getToken(email, password) {
+    try {
+      const response = await axios.post(`${process.env.MAIL_TM_API_URL}/token`, {
+        address: email,
+        password: password
+      });
+      return response.data.token;
+    } catch (error) {
+      console.error('Error getting token:', error);
+      return null;
     }
+  }
 
-    setupCallbacks() {
-        // Handle text messages and keyboard buttons
-        this.bot.on('message', async (msg) => {
-            if (msg.text && !msg.text.startsWith('/')) {
-                await this.handleTextMessage(msg);
-            }
-        });
-
-        // Handle callback queries
-        this.bot.on('callback_query', async (callbackQuery) => {
-            await this.handleCallbackQuery(callbackQuery);
-        });
-    }
-
-    setupErrorHandling() {
-        this.bot.on('error', (error) => {
-            console.error('❌ Telegram Bot Error:', error);
-        });
-
-        this.bot.on('polling_error', (error) => {
-            console.error('❌ Polling Error:', error);
-        });
-
-        process.on('unhandledRejection', (reason, promise) => {
-            console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
-        });
-    }
-
-    async handleTextMessage(msg) {
-        const chatId = msg.chat.id;
-        const text = msg.text;
-        const userId = msg.from.id;
-
-        switch (text) {
-            case '📧 My Email':
-                await this.handleMyEmail(chatId, userId);
-                break;
-            case '🔄 Generate New':
-                await this.handleGenerateEmail(chatId, userId);
-                break;
-            case '📥 Inbox':
-                await this.handleInbox(chatId, userId);
-                break;
-            case '♻️ Recovery':
-                await this.handleRecovery(chatId, userId);
-                break;
-            default:
-                // Check if user is in recovery mode
-                const userState = this.userStates.get(userId);
-                if (userState && userState.action === 'waiting_recovery_email') {
-                    await this.processRecoveryEmail(chatId, userId, text);
-                } else {
-                    await this.sendMainMenu(chatId);
-                }
+  static async getMessages(token) {
+    try {
+      const response = await axios.get(`${process.env.MAIL_TM_API_URL}/messages`, {
+        headers: {
+          'Authorization': `Bearer ${token}`
         }
+      });
+      return response.data['hydra:member'] || [];
+    } catch (error) {
+      console.error('Error fetching messages:', error);
+      return [];
     }
+  }
 
-    async handleCallbackQuery(callbackQuery) {
-        const chatId = callbackQuery.message.chat.id;
-        const messageId = callbackQuery.message.message_id;
-        const userId = callbackQuery.from.id;
-        const data = callbackQuery.data;
-
-        try {
-            await this.bot.answerCallbackQuery(callbackQuery.id);
-
-            if (data.startsWith('read_msg_')) {
-                const messageDbId = data.replace('read_msg_', '');
-                await this.handleReadMessage(chatId, userId, messageDbId, messageId);
-            } else if (data.startsWith('del_msg_')) {
-                const messageDbId = data.replace('del_msg_', '');
-                await this.handleDeleteMessage(chatId, userId, messageDbId, messageId);
-            } else if (data === 'refresh_inbox') {
-                await this.handleInbox(chatId, userId, messageId);
-            } else if (data === 'back_to_inbox') {
-                await this.handleInbox(chatId, userId, messageId);
-            }
-        } catch (error) {
-            console.error('Callback query error:', error);
-            await this.bot.sendMessage(chatId, '❌ An error occurred. Please try again.');
+  static async getMessage(token, messageId) {
+    try {
+      const response = await axios.get(`${process.env.MAIL_TM_API_URL}/messages/${messageId}`, {
+        headers: {
+          'Authorization': `Bearer ${token}`
         }
+      });
+      return response.data;
+    } catch (error) {
+      console.error('Error fetching message:', error);
+      return null;
     }
+  }
 
-    async sendWelcomeMessage(chatId, firstName) {
-        const welcomeText = `😜 Hey ${firstName} Welcome To OUR BoT
-
-🧑‍💻 BoT Created BY : @earning_tips009`;
-
-        await this.bot.sendMessage(chatId, welcomeText, {
-            reply_markup: this.getMainKeyboard()
-        });
+  static async refreshToken(email, password) {
+    try {
+      const newToken = await this.getToken(email, password);
+      if (newToken) {
+        // Update token in database
+        await global.dbPool.execute(
+          'UPDATE emails SET token = ?, last_access = NOW() WHERE email = ?',
+          [newToken, email]
+        );
+        return newToken;
+      }
+      return null;
+    } catch (error) {
+      console.error('Error refreshing token:', error);
+      return null;
     }
-
-    async handleGenerateEmail(chatId, userId) {
-        const loadingMsg = await this.bot.sendMessage(chatId, '⏳ Generating new email...');
-
-        try {
-            const response = await axios.post(`${this.serverUrl}/api/generate`, {
-                telegramUserId: userId
-            });
-
-            const { email, token } = response.data;
-
-            // Store user email data
-            this.userStates.set(userId, {
-                email,
-                token,
-                lastUpdate: Date.now()
-            });
-
-            // Setup WebSocket connection for real-time updates
-            this.setupWebSocketConnection(userId, email, token);
-
-            await this.bot.deleteMessage(chatId, loadingMsg.message_id);
-            
-            const successText = `♻️ New Email Generated Successfully ✅
-
-📬 Email ID : ${email} 👈`;
-
-            await this.bot.sendMessage(chatId, successText, {
-                reply_markup: this.getMainKeyboard()
-            });
-
-        } catch (error) {
-            console.error('Generate email error:', error);
-            await this.bot.editMessageText('❌ Failed to generate email. Please try again.', {
-                chat_id: chatId,
-                message_id: loadingMsg.message_id
-            });
-        }
-    }
-
-    async handleMyEmail(chatId, userId) {
-        const userState = this.userStates.get(userId);
-        
-        if (!userState || !userState.email) {
-            await this.bot.sendMessage(chatId, '❌ No active email found. Please generate a new email first.', {
-                reply_markup: this.getMainKeyboard()
-            });
-            return;
-        }
-
-        const emailText = `📧 *Your Current Email:*
-
-📬 ${userState.email}
-
-⏰ *Status:* Active
-🔄 *Auto-refresh:* Enabled`;
-
-        await this.bot.sendMessage(chatId, emailText, {
-            parse_mode: 'Markdown',
-            reply_markup: this.getMainKeyboard()
-        });
-    }
-
-    async handleInbox(chatId, userId, editMessageId = null) {
-        const userState = this.userStates.get(userId);
-        
-        if (!userState || !userState.email || !userState.token) {
-            const noEmailText = '❌ No active email found. Please generate a new email first.';
-            
-            if (editMessageId) {
-                await this.bot.editMessageText(noEmailText, {
-                    chat_id: chatId,
-                    message_id: editMessageId
-                });
-            } else {
-                await this.bot.sendMessage(chatId, noEmailText, {
-                    reply_markup: this.getMainKeyboard()
-                });
-            }
-            return;
-        }
-
-        const loadingText = editMessageId ? '⏳ Refreshing inbox...' : '⏳ Loading inbox...';
-        
-        let loadingMsg;
-        if (editMessageId) {
-            await this.bot.editMessageText(loadingText, {
-                chat_id: chatId,
-                message_id: editMessageId
-            });
-        } else {
-            loadingMsg = await this.bot.sendMessage(chatId, loadingText);
-        }
-
-        try {
-            const response = await axios.get(`${this.serverUrl}/api/inbox/${userState.email}?token=${userState.token}`);
-            const messages = response.data;
-
-            if (messages.length === 0) {
-                const noMsgText = `📭 No messages in your inbox yet.
-
-📬 Email: ${userState.email}
-⏰ Waiting for incoming emails...`;
-
-                if (editMessageId) {
-                    await this.bot.editMessageText(noMsgText, {
-                        chat_id: chatId,
-                        message_id: editMessageId,
-                        reply_markup: {
-                            inline_keyboard: [[
-                                { text: '🔄 Refresh', callback_data: 'refresh_inbox' }
-                            ]]
-                        }
-                    });
-                } else {
-                    await this.bot.editMessageText(noMsgText, {
-                        chat_id: chatId,
-                        message_id: loadingMsg.message_id,
-                        reply_markup: {
-                            inline_keyboard: [[
-                                { text: '🔄 Refresh', callback_data: 'refresh_inbox' }
-                            ]]
-                        }
-                    });
-                }
-                return;
-            }
-
-            // Show first message details
-            const firstMsg = messages[0];
-            const messageText = `📩 New Mail Received In Your Email ID 🪧
-
-📇 From : ${firstMsg.from}
-
-🗒️ Subject : ${firstMsg.subject}
-
-📅 Date : ${new Date(firstMsg.createdAt).toLocaleString()}
-
-📧 Email : ${userState.email}`;
-
-            const keyboard = {
-                inline_keyboard: [
-                    [
-                        { text: '👀 Read Message', callback_data: `read_msg_${firstMsg.id}` },
-                        { text: '🗑️ Delete', callback_data: `del_msg_${firstMsg.id}` }
-                    ],
-                    [{ text: '🔄 Refresh Inbox', callback_data: 'refresh_inbox' }]
-                ]
-            };
-
-            // Add navigation if more messages exist
-            if (messages.length > 1) {
-                keyboard.inline_keyboard.unshift([
-                    { text: `📨 Message 1 of ${messages.length}`, callback_data: 'msg_info' }
-                ]);
-            }
-
-            if (editMessageId) {
-                await this.bot.editMessageText(messageText, {
-                    chat_id: chatId,
-                    message_id: editMessageId,
-                    reply_markup: keyboard
-                });
-            } else {
-                await this.bot.editMessageText(messageText, {
-                    chat_id: chatId,
-                    message_id: loadingMsg.message_id,
-                    reply_markup: keyboard
-                });
-            }
-
-        } catch (error) {
-            console.error('Inbox error:', error);
-            const errorText = '❌ Failed to load inbox. Please try again later.';
-            
-            if (editMessageId) {
-                await this.bot.editMessageText(errorText, {
-                    chat_id: chatId,
-                    message_id: editMessageId
-                });
-            } else if (loadingMsg) {
-                await this.bot.editMessageText(errorText, {
-                    chat_id: chatId,
-                    message_id: loadingMsg.message_id
-                });
-            } else {
-                await this.bot.sendMessage(chatId, errorText);
-            }
-        }
-    }
-
-    async handleReadMessage(chatId, userId, messageId, botMessageId) {
-        const userState = this.userStates.get(userId);
-        
-        if (!userState || !userState.email || !userState.token) {
-            await this.bot.editMessageText('❌ Session expired. Please generate a new email.', {
-                chat_id: chatId,
-                message_id: botMessageId
-            });
-            return;
-        }
-
-        try {
-            const response = await axios.get(`${this.serverUrl}/api/message/${userState.email}/${messageId}?token=${userState.token}`);
-            const message = response.data;
-
-            const messageText = `📩 *Message Content:*
-
-📇 *From:* ${message.from.address}
-🗒️ *Subject:* ${message.subject || 'No Subject'}
-📅 *Date:* ${new Date(message.createdAt).toLocaleString()}
-
-💬 *Text:* ${message.text || message.html || 'No content available'}`;
-
-            await this.bot.editMessageText(messageText, {
-                chat_id: chatId,
-                message_id: botMessageId,
-                parse_mode: 'Markdown',
-                reply_markup: {
-                    inline_keyboard: [
-                        [
-                            { text: '🗑️ Delete Message', callback_data: `del_msg_${messageId}` },
-                            { text: '⬅️ Back to Inbox', callback_data: 'back_to_inbox' }
-                        ]
-                    ]
-                }
-            });
-
-        } catch (error) {
-            console.error('Read message error:', error);
-            await this.bot.editMessageText('❌ Failed to read message. Please try again.', {
-                chat_id: chatId,
-                message_id: botMessageId
-            });
-        }
-    }
-
-    async handleDeleteMessage(chatId, userId, messageId, botMessageId) {
-        const userState = this.userStates.get(userId);
-        
-        if (!userState || !userState.email || !userState.token) {
-            await this.bot.editMessageText('❌ Session expired. Please generate a new email.', {
-                chat_id: chatId,
-                message_id: botMessageId
-            });
-            return;
-        }
-
-        try {
-            await axios.delete(`${this.serverUrl}/api/message/${userState.email}/${messageId}?token=${userState.token}`);
-
-            await this.bot.editMessageText('✅ Message deleted successfully!', {
-                chat_id: chatId,
-                message_id: botMessageId,
-                reply_markup: {
-                    inline_keyboard: [[
-                        { text: '⬅️ Back to Inbox', callback_data: 'back_to_inbox' }
-                    ]]
-                }
-            });
-
-        } catch (error) {
-            console.error('Delete message error:', error);
-            await this.bot.editMessageText('❌ Failed to delete message. Please try again.', {
-                chat_id: chatId,
-                message_id: botMessageId
-            });
-        }
-    }
-
-    async handleRecovery(chatId, userId) {
-        const recoveryText = '✉️ Please enter your recovery email:';
-
-        this.userStates.set(userId, {
-            ...this.userStates.get(userId),
-            action: 'waiting_recovery_email'
-        });
-
-        await this.bot.sendMessage(chatId, recoveryText, {
-            reply_markup: {
-                force_reply: true,
-                input_field_placeholder: 'Enter your email address...'
-            }
-        });
-    }
-
-    async processRecoveryEmail(chatId, userId, emailAddress) {
-        const loadingMsg = await this.bot.sendMessage(chatId, '⏳ Recovering email...');
-
-        try {
-            const response = await axios.post(`${this.serverUrl}/api/recover`, {
-                email: emailAddress,
-                telegramUserId: userId
-            });
-
-            const { email, token } = response.data;
-
-            // Store recovered email data
-            this.userStates.set(userId, {
-                email,
-                token,
-                lastUpdate: Date.now()
-            });
-
-            // Setup WebSocket connection
-            this.setupWebSocketConnection(userId, email, token);
-
-            await this.bot.deleteMessage(chatId, loadingMsg.message_id);
-            
-            const successText = `♻️ Recovery Email Successfully ✅
-
-📬 Recovery Email ID : ${email} 👈`;
-
-            await this.bot.sendMessage(chatId, successText, {
-                reply_markup: this.getMainKeyboard()
-            });
-
-        } catch (error) {
-            console.error('Recovery error:', error);
-            await this.bot.editMessageText('❌ Failed to recover email. Email not found or expired.', {
-                chat_id: chatId,
-                message_id: loadingMsg.message_id,
-                reply_markup: this.getMainKeyboard()
-            });
-        }
-
-        // Clear recovery state
-        const currentState = this.userStates.get(userId) || {};
-        delete currentState.action;
-        this.userStates.set(userId, currentState);
-    }
-
-    async handleStats(chatId, userId) {
-        try {
-            const response = await axios.get(`${this.serverUrl}/api/user/${userId}/emails`);
-            const emails = response.data;
-
-            const statsText = `📊 *Your Statistics:*
-
-📧 *Total Emails:* ${emails.length}
-⚡ *Active Sessions:* ${this.activeConnections.has(userId) ? '1' : '0'}
-🔄 *Real-time Updates:* ${this.activeConnections.has(userId) ? 'Enabled' : 'Disabled'}
-
-📈 *Recent Activity:*
-${emails.slice(0, 3).map(email => `• ${email.email} - ${new Date(email.last_access).toLocaleDateString()}`).join('\n') || 'No recent activity'}`;
-
-            await this.bot.sendMessage(chatId, statsText, {
-                parse_mode: 'Markdown',
-                reply_markup: this.getMainKeyboard()
-            });
-
-        } catch (error) {
-            console.error('Stats error:', error);
-            await this.bot.sendMessage(chatId, '❌ Failed to load statistics.', {
-                reply_markup: this.getMainKeyboard()
-            });
-        }
-    }
-
-    setupWebSocketConnection(userId, email, token) {
-        // Close existing connection if any
-        if (this.activeConnections.has(userId)) {
-            this.activeConnections.get(userId).close();
-        }
-
-        try {
-            const wsUrl = this.serverUrl.replace('http', 'ws').replace('https', 'wss');
-            const ws = new WebSocket(wsUrl);
-
-            ws.on('open', () => {
-                console.log(`🔗 WebSocket connected for user ${userId}`);
-                
-                // Subscribe to email updates
-                ws.send(JSON.stringify({
-                    action: 'subscribe',
-                    email,
-                    token,
-                    telegramUserId: userId
-                }));
-
-                this.activeConnections.set(userId, ws);
-            });
-
-            ws.on('message', async (data) => {
-                try {
-                    const message = JSON.parse(data);
-                    await this.handleWebSocketMessage(userId, message);
-                } catch (error) {
-                    console.error('WebSocket message error:', error);
-                }
-            });
-
-            ws.on('close', () => {
-                console.log(`🔌 WebSocket disconnected for user ${userId}`);
-                this.activeConnections.delete(userId);
-            });
-
-            ws.on('error', (error) => {
-                console.error('WebSocket error:', error);
-                this.activeConnections.delete(userId);
-            });
-
-        } catch (error) {
-            console.error('WebSocket setup error:', error);
-        }
-    }
-
-    async handleWebSocketMessage(userId, message) {
-        if (message.action === 'inbox_update' && message.messages && message.messages.length > 0) {
-            const userState = this.userStates.get(userId);
-            if (!userState) return;
-
-            // Check if there are new messages
-            const latestMessage = message.messages[0];
-            const chatId = userId; // Assuming chat_id is same as user_id
-
-            // Send notification about new email
-            const notificationText = `🔔 *New Email Received!*
-
-📇 From: ${latestMessage.from}
-🗒️ Subject: ${latestMessage.subject}
-📅 Time: ${new Date(latestMessage.createdAt).toLocaleString()}
-
-📧 Email: ${message.email}`;
-
-            try {
-                await this.bot.sendMessage(chatId, notificationText, {
-                    parse_mode: 'Markdown',
-                    reply_markup: {
-                        inline_keyboard: [[
-                            { text: '👀 View Message', callback_data: `read_msg_${latestMessage.id}` },
-                            { text: '📥 Open Inbox', callback_data: 'refresh_inbox' }
-                        ]]
-                    }
-                });
-            } catch (error) {
-                console.error('Failed to send notification:', error);
-            }
-        }
-    }
-
-    async sendMainMenu(chatId) {
-        const menuText = `🎯 *Main Menu*
-
-Choose an option from the keyboard below:`;
-
-        await this.bot.sendMessage(chatId, menuText, {
-            parse_mode: 'Markdown',
-            reply_markup: this.getMainKeyboard()
-        });
-    }
-
-    getMainKeyboard() {
-        return {
-            keyboard: [
-                [{ text: "📧 My Email" }],
-                [
-                    { text: "🔄 Generate New" }, 
-                    { text: "📥 Inbox" }
-                ],
-                [{ text: "♻️ Recovery" }]
-            ],
-            resize_keyboard: true,
-            one_time_keyboard: false
-        };
-    }
+  }
 }
 
-// Start the bot
-const bot = new TempEmailTelegramBot();
+// Database functions
+async function saveEmailToDb(userId, email, password, token) {
+  try {
+    await global.dbPool.execute(
+      'INSERT INTO emails (user_id, email, password, token) VALUES (?, ?, ?, ?)',
+      [userId, email, password, token]
+    );
+    return true;
+  } catch (error) {
+    console.error('Error saving email to database:', error);
+    return false;
+  }
+}
 
-// Export for testing
-module.exports = TempEmailTelegramBot;
+async function getUserEmails(userId) {
+  try {
+    const [rows] = await global.dbPool.execute(
+      'SELECT * FROM emails WHERE user_id = ? ORDER BY last_access DESC',
+      [userId]
+    );
+    return rows;
+  } catch (error) {
+    console.error('Error fetching user emails:', error);
+    return [];
+  }
+}
+
+async function getEmailByAddress(email) {
+  try {
+    const [rows] = await global.dbPool.execute(
+      'SELECT * FROM emails WHERE email = ? LIMIT 1',
+      [email]
+    );
+    return rows[0] || null;
+  } catch (error) {
+    console.error('Error fetching email by address:', error);
+    return null;
+  }
+}
+
+async function updateLastAccess(email) {
+  try {
+    await global.dbPool.execute(
+      'UPDATE emails SET last_access = NOW() WHERE email = ?',
+      [email]
+    );
+  } catch (error) {
+    console.error('Error updating last access:', error);
+  }
+}
+
+// Bot command handlers
+bot.start((ctx) => {
+  const message = `😜 Hey Anish Welcome To OUR BoT
+
+🧑‍💻 BoT Created BY : @earning_tips009`;
+  
+  ctx.reply(message, mainKeyboard);
+});
+
+// Generate New Email
+bot.hears('🔄 Generate New', async (ctx) => {
+  try {
+    const userId = ctx.from.id.toString();
+    
+    // Get available domains
+    const domains = await EmailService.getDomains();
+    if (domains.length === 0) {
+      return ctx.reply('❌ No domains available. Please try again later.');
+    }
+    
+    // Generate random email and password
+    const randomString = Math.random().toString(36).substring(2, 10);
+    const domain = domains[0].domain;
+    const email = `${randomString}@${domain}`;
+    const password = Math.random().toString(36).substring(2, 12);
+    
+    // Create account
+    const account = await EmailService.createAccount(email, password);
+    if (!account) {
+      return ctx.reply('❌ Failed to create email account. Please try again.');
+    }
+    
+    // Get token
+    const token = await EmailService.getToken(email, password);
+    if (!token) {
+      return ctx.reply('❌ Failed to get access token. Please try again.');
+    }
+    
+    // Save to database
+    const saved = await saveEmailToDb(userId, email, password, token);
+    if (!saved) {
+      return ctx.reply('❌ Failed to save email. Please try again.');
+    }
+    
+    // Success message - exactly as specified
+    const successMessage = `♻️ New Email Generated Successfully ✅
+
+📬 Email ID : ${email} 👈`;
+    
+    ctx.reply(successMessage, mainKeyboard);
+    
+  } catch (error) {
+    console.error('Error generating new email:', error);
+    ctx.reply('❌ An error occurred. Please try again.');
+  }
+});
+
+// My Email
+bot.hears('📧 My Email', async (ctx) => {
+  try {
+    const userId = ctx.from.id.toString();
+    const userEmails = await getUserEmails(userId);
+    
+    if (userEmails.length === 0) {
+      return ctx.reply('❌ No email found. Please generate a new email first.', mainKeyboard);
+    }
+    
+    const latestEmail = userEmails[0];
+    const message = `📧 Your Active Email:
+
+📬 Email ID : ${latestEmail.email} 👈
+🕒 Created : ${new Date(latestEmail.created_at).toLocaleString()}
+🔄 Last Access : ${new Date(latestEmail.last_access).toLocaleString()}`;
+    
+    ctx.reply(message, mainKeyboard);
+    
+  } catch (error) {
+    console.error('Error fetching user email:', error);
+    ctx.reply('❌ An error occurred. Please try again.');
+  }
+});
+
+// Inbox
+bot.hears('📥 Inbox', async (ctx) => {
+  try {
+    const userId = ctx.from.id.toString();
+    const userEmails = await getUserEmails(userId);
+    
+    if (userEmails.length === 0) {
+      return ctx.reply('❌ No email found. Please generate a new email first.', mainKeyboard);
+    }
+    
+    const emailData = userEmails[0];
+    let token = emailData.token;
+    
+    // Try to get messages
+    let messages = await EmailService.getMessages(token);
+    
+    // If token expired, refresh it
+    if (messages.length === 0 || messages.error) {
+      token = await EmailService.refreshToken(emailData.email, emailData.password);
+      if (token) {
+        messages = await EmailService.getMessages(token);
+      } else {
+        return ctx.reply('❌ Failed to refresh access token. Please try again.', mainKeyboard);
+      }
+    }
+    
+    await updateLastAccess(emailData.email);
+    
+    if (messages.length === 0) {
+      return ctx.reply('📭 No messages found in your inbox.', mainKeyboard);
+    }
+    
+    // Get the latest message details
+    const latestMessage = messages[0];
+    const messageDetails = await EmailService.getMessage(token, latestMessage.id);
+    
+    if (!messageDetails) {
+      return ctx.reply('❌ Failed to fetch message details.', mainKeyboard);
+    }
+    
+    // Format message exactly as specified
+    const inboxMessage = `📩 New Mail Received In Your Email ID 🪧
+
+📇 From : ${messageDetails.from.address}
+
+🗒️ Subject : ${messageDetails.subject}
+
+💬 Text : ${messageDetails.text || messageDetails.html || 'No content available'}`;
+    
+    ctx.reply(inboxMessage, mainKeyboard);
+    
+    // Broadcast real-time update via WebSocket
+    if (global.broadcastInboxUpdate) {
+      global.broadcastInboxUpdate(userId, {
+        email: emailData.email,
+        message: messageDetails,
+        timestamp: new Date().toISOString()
+      });
+    }
+    
+  } catch (error) {
+    console.error('Error fetching inbox:', error);
+    ctx.reply('❌ An error occurred while fetching inbox. Please try again.');
+  }
+});
+
+// Recovery
+bot.hears('♻️ Recovery', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  userSessions.set(userId, { state: 'awaiting_recovery_email' });
+  
+  ctx.reply('✉️ Please enter your recovery email:', {
+    reply_markup: {
+      force_reply: true
+    }
+  });
+});
+
+// Handle text messages (for recovery and other inputs)
+bot.on('text', async (ctx) => {
+  const userId = ctx.from.id.toString();
+  const session = userSessions.get(userId);
+  
+  if (session && session.state === 'awaiting_recovery_email') {
+    const recoveryEmail = ctx.message.text.trim();
+    
+    try {
+      // Check if email exists in database
+      const emailData = await getEmailByAddress(recoveryEmail);
+      
+      if (!emailData) {
+        userSessions.delete(userId);
+        return ctx.reply('❌ Email not found in our records. Please check and try again.', mainKeyboard);
+      }
+      
+      // Refresh token
+      const newToken = await EmailService.refreshToken(emailData.email, emailData.password);
+      
+      if (!newToken) {
+        userSessions.delete(userId);
+        return ctx.reply('❌ Failed to recover email access. Please try again.', mainKeyboard);
+      }
+      
+      // Update last access
+      await updateLastAccess(emailData.email);
+      
+      // Success message - exactly as specified
+      const recoveryMessage = `♻️ Recovery Email Successfully ✅
+
+📬 Recovery Email ID : ${emailData.email} 👈`;
+      
+      ctx.reply(recoveryMessage, mainKeyboard);
+      
+      // Clear session
+      userSessions.delete(userId);
+      
+    } catch (error) {
+      console.error('Error during email recovery:', error);
+      userSessions.delete(userId);
+      ctx.reply('❌ An error occurred during recovery. Please try again.');
+    }
+  }
+});
+
+// Error handling
+bot.catch((err, ctx) => {
+  console.error('Bot error:', err);
+  ctx.reply('❌ An unexpected error occurred. Please try again.');
+});
+
+// Periodic inbox checking for real-time updates
+setInterval(async () => {
+  try {
+    // Get all recent active emails (accessed in last 30 minutes)
+    const [activeEmails] = await global.dbPool.execute(`
+      SELECT DISTINCT user_id, email, password, token 
+      FROM emails 
+      WHERE last_access > DATE_SUB(NOW(), INTERVAL 30 MINUTE)
+      ORDER BY last_access DESC
+    `);
+    
+    for (const emailData of activeEmails) {
+      try {
+        let token = emailData.token;
+        let messages = await EmailService.getMessages(token);
+        
+        // If token expired, refresh it
+        if (messages.error) {
+          token = await EmailService.refreshToken(emailData.email, emailData.password);
+          if (token) {
+            messages = await EmailService.getMessages(token);
+          }
+        }
+        
+        if (messages && messages.length > 0 && global.broadcastInboxUpdate) {
+          global.broadcastInboxUpdate(emailData.user_id, {
+            email: emailData.email,
+            messageCount: messages.length,
+            latestMessage: messages[0],
+            timestamp: new Date().toISOString()
+          });
+        }
+      } catch (error) {
+        console.error(`Error checking inbox for ${emailData.email}:`, error);
+      }
+    }
+  } catch (error) {
+    console.error('Error in periodic inbox check:', error);
+  }
+}, 30000); // Check every 30 seconds
+
+module.exports = bot;
