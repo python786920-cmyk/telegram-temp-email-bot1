@@ -1,0 +1,19 @@
+# Database Configuration
+DB_HOST=cashearnersofficial.xyz
+DB_USER=cztldhwx_tampemail
+DB_PASSWORD=Aptap786920
+DB_NAME=cztldhwx_tampemail
+
+# Telegram Bot Configuration
+TELEGRAM_BOT_TOKEN=8006290667:AAFrfrSsgNWDjuwqToSoGB9x-9nGyUIltyE
+TELEGRAM_WEBHOOK_URL=https://your-render-app.onrender.com/webhook
+
+# Server Configuration
+PORT=3000
+NODE_ENV=production
+
+# Mail.tm API Configuration
+MAIL_TM_BASE_URL=https://api.mail.tm
+
+# WebSocket Configuration
+WS_PORT=3001
