@@ -1,13 +1,14 @@
 {
-  "name": "telegram-temp-email-bot",
+  "name": "temp-email-telegram-bot",
   "version": "1.0.0",
-  "description": "Advanced Telegram Temp Email Bot with WebSocket",
+  "description": "Professional Temporary Email Telegram Bot with WebSocket support",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
-    "dev": "nodemon server.js"
+    "dev": "nodemon server.js",
+    "bot": "node bot.js"
   },
-  "keywords": ["telegram", "bot", "temp-email", "websocket"],
+  "keywords": ["telegram", "bot", "temp-email", "websocket", "nodejs"],
   "author": "Aptap Pro",
   "license": "MIT",
   "dependencies": {
@@ -18,9 +19,13 @@
     "axios": "^1.6.2",
     "dotenv": "^16.3.1",
     "cors": "^2.8.5",
-    "body-parser": "^1.20.2"
+    "helmet": "^7.1.0",
+    "compression": "^1.7.4"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=16.0.0"
   }
 }
