@@ -1,32 +1,17 @@
-# Server Configuration
-PORT=3000
-NODE_ENV=production
+# Telegram Bot Configuration
+BOT_TOKEN=8006290667:AAFrfrSsgNWDjuwqToSoGB9x-9nGyUIltyE
 
-# Database Configuration (MySQL)
+# Database Configuration
 DB_HOST=cashearnersofficial.xyz
 DB_USER=cztldhwx_tampemail
-DB_PASS=Aptap786920
+DB_PASSWORD=Aptap786920
 DB_NAME=cztldhwx_tampemail
 
-# Telegram Bot Configuration
-TELEGRAM_BOT_TOKEN=8006290667:AAFrfrSsgNWDjuwqToSoGB9x-9nGyUIltyE
-WEBHOOK_URL=https://telegram-temp-email-bot1.onrender.com
+# Server Configuration
+PORT=3000
 
 # Mail.tm API Configuration
-MAIL_TM_BASE_URL=https://api.mail.tm
-
-# Security & Performance
-JWT_SECRET=your_jwt_secret_here
-RATE_LIMIT=100
-CORS_ORIGIN=*
+MAIL_TM_API_URL=https://api.mail.tm
 
 # WebSocket Configuration
 WS_PORT=3001
-
-# Auto-refresh interval (milliseconds)
-AUTO_REFRESH_INTERVAL=10000
-
-# Database Connection Pool
-DB_CONNECTION_LIMIT=10
-DB_ACQUIRE_TIMEOUT=60000
-DB_TIMEOUT=60000
