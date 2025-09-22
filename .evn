@@ -1,4 +1,4 @@
-# Telegram Bot Configuration
+# Telegram Bot Token - Get from @BotFather
 BOT_TOKEN=8006290667:AAFrfrSsgNWDjuwqToSoGB9x-9nGyUIltyE
 
 # Database Configuration
@@ -10,8 +10,5 @@ DB_NAME=cztldhwx_tampemail
 # Server Configuration
 PORT=3000
 
-# Mail.tm API Configuration
-MAIL_TM_API_URL=https://api.mail.tm
-
-# WebSocket Configuration
-WS_PORT=3001
+# Mail.tm API (no key required - it's free)
+MAILTM_API_URL=https://api.mail.tm
